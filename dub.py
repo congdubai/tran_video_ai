@@ -17,6 +17,14 @@ import os
 import sys
 from typing import List, Tuple
 
+# Đảm bảo in tiếng Việt mượt mà trên console Windows (không bị lỗi charmap cp1252)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Đảm bảo import được các module trong thư mục src
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:

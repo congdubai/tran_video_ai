@@ -1,4 +1,4 @@
-"""
+r"""
 Module làm mờ phụ đề cũ bằng FFmpeg và phủ phụ đề ASS mới lên video.
 Giải thích cho người mới:
 - Quy trình FFmpeg Filter Graph:
