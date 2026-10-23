@@ -3,23 +3,26 @@
 Công cụ tự động chuyển đổi Video phụ đề tiếng Trung sang Thuyết minh tiếng Việt.
 Tác giả: Senior Software Engineer (hướng dẫn cho dev Java/React).
 
-Cách chạy:
+Cách chạy mẫu:
     python dub.py video.mp4 --preview-region
     python dub.py video.mp4 --stop-after ocr
-    python dub.py video.mp4 --translate ollama --tts kokoro --keep-original 0.15
+    python dub.py video.mp4 --stop-after translate
+    python dub.py video.mp4 --translate ollama --tts kokoro --keep-original 0.15 --duck
+    python dub.py video.mp4 --translate echo --tts silent --out test_output.mp4
 """
 
 import argparse
 import json
 import os
 import sys
+from typing import List, Tuple
 
 # Đảm bảo import được các module trong thư mục src
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from src.config import AppConfig, SubtitleCue
+from src.config import AppConfig, SubtitleCue, OCRBox
 from src.video_utils import get_video_info, generate_preview_region
 from src.ocr.engine import process_video_ocr
 from src.ocr.grouper import group_cues, cues_to_json_dict, json_dict_to_cues
@@ -31,13 +34,25 @@ from src.translation import (
     translate_cues_in_batches
 )
 from src.translation.batch import save_cues_vi, load_cues_vi
+from src.subtitles import (
+    calculate_blur_rect,
+    generate_ass_file
+)
+from src.tts import (
+    BaseTTS,
+    SilentTTS,
+    KokoroTTS,
+    EdgeTTS,
+    adjust_audio_speed
+)
+from src.audio import (
+    build_full_voice_track,
+    mix_video_and_audio
+)
 
 
 def parse_arguments() -> AppConfig:
-    """
-    Xử lý các tham số dòng lệnh (CLI Arguments).
-    Giống như CommandLineRunner / args[] trong Spring Boot hoặc process.argv trong Node.js.
-    """
+    """Xử lý các tham số dòng lệnh (CLI Arguments)."""
     parser = argparse.ArgumentParser(
         description="Auto Sub-to-Dub: Dịch và Thuyết minh Video phụ đề tiếng Trung sang tiếng Việt",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -107,7 +122,7 @@ def parse_arguments() -> AppConfig:
 
     args = parser.parse_args()
 
-    # Phân tích region "0.60,0.95" hoặc "0.60:0.95"
+    # Phân tích region
     region_str = args.region.replace(":", ",")
     r_parts = [float(p.strip()) for p in region_str.split(",") if p.strip()]
     if len(r_parts) != 2 or r_parts[0] >= r_parts[1]:
@@ -168,12 +183,11 @@ def step_preview_region(config: AppConfig):
     print("[+] Nếu chưa chuẩn, hãy điều chỉnh lại bằng: --region 0.65,0.92")
 
 
-def step_ocr_and_group(config: AppConfig) -> list:
+def step_ocr_and_group(config: AppConfig) -> List[SubtitleCue]:
     """Xử lý Bước 1, Bước 2, Bước 3 (OCR và gom cụm câu). Có hỗ trợ đọc lại cache."""
     cues_file = os.path.join(config.work_dir, "cues.json")
     os.makedirs(config.work_dir, exist_ok=True)
 
-    # Kiểm tra cache cues.json đã tồn tại từ lần chạy trước chưa
     if os.path.exists(cues_file):
         print(f"[*] Tìm thấy file cache có sẵn: {cues_file}")
         print("[*] Đang tải lại danh sách câu phụ đề (bỏ qua OCR để tiết kiệm thời gian)...")
@@ -187,10 +201,8 @@ def step_ocr_and_group(config: AppConfig) -> list:
     print("BƯỚC 1 - 3: TRÍCH KHUNG HÌNH, OCR VÀ GOM CÂU PHỤ ĐỀ")
     print("=" * 60)
 
-    # 1. Trích xuất và OCR từng khung hình
     frame_results = process_video_ocr(config.video_path, config)
 
-    # 2. Gom cụm các khung hình liên tiếp thành câu
     print("[*] Đang gom cụm các khung hình liên tiếp và lọc nhiễu...")
     cues = group_cues(
         frame_results=frame_results,
@@ -199,14 +211,13 @@ def step_ocr_and_group(config: AppConfig) -> list:
         min_consecutive_frames=config.min_consecutive_frames
     )
 
-    # 3. Lưu lại file cues.json
     cues_data = cues_to_json_dict(cues)
     with open(cues_file, "w", encoding="utf-8") as f:
         json.dump(cues_data, f, ensure_ascii=False, indent=2)
 
     print(f"[+] Đã phát hiện {len(cues)} câu phụ đề hợp lệ.")
     print(f"[+] Đã lưu kết quả vào: {cues_file}")
-    for c in cues[:5]:  # In thử 5 câu đầu
+    for c in cues[:5]:
         print(f"    [{c.start:.2f}s -> {c.end:.2f}s] {c.text_zh}")
     if len(cues) > 5:
         print(f"    ... và {len(cues) - 5} câu tiếp theo.")
@@ -229,11 +240,10 @@ def get_translator(config: AppConfig) -> BaseTranslator:
         raise ValueError(f"Không hỗ trợ bộ máy dịch: '{config.translator_type}'. Chỉ chọn: ollama, gemini, echo.")
 
 
-def step_translate(cues: list, config: AppConfig) -> list:
+def step_translate(cues: List[SubtitleCue], config: AppConfig) -> List[SubtitleCue]:
     """Xử lý Bước 4 (Dịch thuật sang tiếng Việt). Hỗ trợ đọc lại cache cues_vi.json."""
     cues_vi_file = os.path.join(config.work_dir, "cues_vi.json")
 
-    # Kiểm tra cache cues_vi.json đã tồn tại từ lần chạy trước hoặc người dùng đã sửa tay
     if os.path.exists(cues_vi_file):
         print(f"[*] Tìm thấy file bản dịch đã có: {cues_vi_file}")
         print("[*] Đang tải lại bản dịch tiếng Việt (bỏ qua gọi AI)...")
@@ -253,7 +263,6 @@ def step_translate(cues: list, config: AppConfig) -> list:
         context_count=3
     )
 
-    # Lưu lại file cues_vi.json
     save_cues_vi(translated_cues, cues_vi_file)
     print(f"[+] Đã lưu bản dịch tiếng Việt vào: {cues_vi_file}")
 
@@ -265,6 +274,90 @@ def step_translate(cues: list, config: AppConfig) -> list:
     return translated_cues
 
 
+def get_tts_engine(config: AppConfig) -> BaseTTS:
+    """Khởi tạo bộ máy TTS tương ứng theo tham số --tts."""
+    tts_type = config.tts_type.lower()
+    if tts_type == "kokoro":
+        return KokoroTTS(voice=config.voice, device=config.tts_device)
+    elif tts_type == "edge-tts":
+        return EdgeTTS(voice=config.voice)
+    elif tts_type == "silent":
+        return SilentTTS()
+    else:
+        raise ValueError(f"Không hỗ trợ bộ máy TTS: '{config.tts_type}'. Chỉ chọn: kokoro, edge-tts, silent.")
+
+
+def step_tts_and_build_track(cues: List[SubtitleCue], config: AppConfig, total_duration: float) -> str:
+    """
+    Xử lý Bước 7:
+    - Đọc từng câu bằng TTS.
+    - Điều chỉnh tốc độ atempo nếu giọng dài hơn khung thời gian.
+    - Ghép thành track âm thanh thuyết minh tổng 24000Hz Mono.
+    """
+    print("=" * 60)
+    print("BƯỚC 7: TỔNG HỢP GIỌNG ĐỌC THUYẾT MINH (TTS) & KHỚP NHỊP")
+    print("=" * 60)
+
+    tts = get_tts_engine(config)
+    print(f"[*] Sử dụng bộ máy TTS: [{tts.name}]")
+
+    audio_dir = os.path.join(config.work_dir, "audio")
+    os.makedirs(audio_dir, exist_ok=True)
+
+    overflow_count = 0
+
+    for idx, cue in enumerate(cues):
+        text = (cue.text_vi or cue.text_zh).strip()
+        raw_wav = os.path.join(audio_dir, f"cue_{cue.id:04d}_raw.wav")
+        adjusted_wav = os.path.join(audio_dir, f"cue_{cue.id:04d}.wav")
+
+        # 1. Đọc văn bản sang âm thanh WAV
+        # Tái sử dụng file âm thanh nếu đã sinh trước đó
+        if not os.path.exists(raw_wav):
+            tts.synthesize(text, raw_wav)
+
+        # 2. Tính khoảng thời gian cho phép trước khi câu kế tiếp bắt đầu
+        if idx + 1 < len(cues):
+            available_window = cues[idx + 1].start - cue.start
+        else:
+            available_window = max(1.0, cue.end - cue.start)
+
+        # 3. Tăng tốc bằng atempo nếu cần
+        new_duration, is_overflow = adjust_audio_speed(
+            input_wav=raw_wav,
+            output_wav=adjusted_wav,
+            available_window=available_window,
+            max_tempo=config.max_tempo,
+            sample_rate=tts.sample_rate
+        )
+
+        cue.audio_path = adjusted_wav
+        cue.audio_duration = new_duration
+
+        if is_overflow:
+            overflow_count += 1
+            print(f"    [!] Câu #{cue.id} bị tràn: Giọng đọc ({new_duration:.2f}s) > Khoảng trống ({available_window:.2f}s). Đã cho lấn sang khoảng lặng.")
+
+        if (idx + 1) % 5 == 0 or idx == len(cues) - 1:
+            print(f"    - Tiến độ TTS: {idx + 1}/{len(cues)} câu...")
+
+    if overflow_count > 0:
+        print(f"\n[!] CẢNH BÁO TỔNG KẾT: Có {overflow_count}/{len(cues)} câu bị tràn thời lượng (vẫn đọc được nhờ cơ chế lấn khoảng lặng).")
+        print(f"[!] Gợi ý: Bạn có thể mở file '{config.work_dir}/cues_vi.json' để rút gọn bớt từ ngữ cho các câu trên rồi chạy lại.\n")
+
+    # 4. Ghép toàn bộ câu thành 1 track âm thanh master
+    print("[*] Đang ghép nối toàn bộ câu thành track thuyết minh đồng bộ...")
+    master_track = os.path.join(config.work_dir, "full_voice_track.wav")
+    build_full_voice_track(
+        cues=cues,
+        total_video_duration=total_duration,
+        output_track_path=master_track,
+        sample_rate=tts.sample_rate
+    )
+    print(f"[+] Đã tạo track thuyết minh hoàn chỉnh: {master_track}")
+    return master_track
+
+
 def main():
     try:
         config = parse_arguments()
@@ -272,12 +365,14 @@ def main():
         print(f"[LỖI THAM SỐ] {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Kiểm tra file video tồn tại
     if not os.path.exists(config.video_path):
         print(f"[LỖI] Không tìm thấy file video đầu vào: {config.video_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Chế độ 1: Xem trước vùng OCR
+    # Lấy thông số kỹ thuật video
+    video_info = get_video_info(config.video_path)
+
+    # 1. Chế độ xem trước vùng OCR
     if config.preview_region:
         try:
             step_preview_region(config)
@@ -286,39 +381,94 @@ def main():
             sys.exit(1)
         return
 
-    # Chế độ 2: Chạy OCR & Gom câu (hoặc nạp từ cues.json)
+    # 2. Chế độ OCR & Gom câu
     try:
         cues = step_ocr_and_group(config)
     except Exception as e:
         print(f"[LỖI OCR] {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Kiểm tra dừng sau OCR
     if config.stop_after == "ocr":
         print("=" * 60)
         print("[!] Đã dừng theo tham số --stop-after ocr.")
-        print(f"[!] Bạn có thể mở file '{config.work_dir}/cues.json' để kiểm tra hoặc chỉnh sửa câu chữ.")
-        print("[!] Sau đó chạy lại lệnh (hệ thống sẽ tự động dùng lại file này mà không cần OCR lại).")
+        print(f"[!] Bạn có thể mở file '{config.work_dir}/cues.json' để kiểm tra câu chữ.")
         print("=" * 60)
         return
 
-    # Chế độ 3: Dịch thuật sang tiếng Việt (hoặc nạp từ cues_vi.json)
+    # 3. Chế độ Dịch thuật
     try:
         translated_cues = step_translate(cues, config)
     except Exception as e:
         print(f"[LỖI DỊCH THUẬT] {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Kiểm tra dừng sau Translate
     if config.stop_after == "translate":
         print("=" * 60)
         print("[!] Đã dừng theo tham số --stop-after translate.")
-        print(f"[!] Bạn có thể mở file '{config.work_dir}/cues_vi.json' để kiểm tra hoặc trau chuốt lại câu dịch.")
-        print("[!] Sau đó chạy lại lệnh (hệ thống sẽ dùng trực tiếp bản dịch đã sửa để làm mờ, phụ đề và đọc giọng).")
+        print(f"[!] Bạn có thể mở file '{config.work_dir}/cues_vi.json' để trau chuốt lại câu dịch.")
         print("=" * 60)
         return
 
-    print("\n[*] Tiếp tục các bước tiếp theo...")
+    # 4. Tính toán hình chữ nhật làm mờ phụ đề cũ
+    print("=" * 60)
+    print("BƯỚC 5: TÍNH TOÁN VÙNG LÀM MỜ PHỤ ĐỀ CŨ")
+    print("=" * 60)
+    all_boxes = [box for c in translated_cues for box in c.boxes]
+    font_size = config.font_size or max(18, int(video_info["height"] * 0.042))
+    blur_rect = calculate_blur_rect(
+        boxes=all_boxes,
+        video_width=video_info["width"],
+        video_height=video_info["height"],
+        font_size=font_size,
+        manual_rect=config.mask_rect
+    )
+    print(f"[+] Toạ độ vùng làm mờ: x={blur_rect[0]}, y={blur_rect[1]}, w={blur_rect[2]}, h={blur_rect[3]}")
+
+    # 5. Sinh giọng đọc TTS và tạo track thuyết minh 24000Hz
+    voice_track_wav = step_tts_and_build_track(
+        cues=translated_cues,
+        config=config,
+        total_duration=video_info["duration"]
+    )
+
+    # 6. Sinh file phụ đề ASS tiếng Việt (đặt ở tâm vùng làm mờ)
+    print("=" * 60)
+    print("BƯỚC 6: SINH FILE PHỤ ĐỀ ASS TIẾNG VIỆT")
+    print("=" * 60)
+    ass_file = os.path.join(config.work_dir, "subtitles.ass")
+    generate_ass_file(
+        cues=translated_cues,
+        video_width=video_info["width"],
+        video_height=video_info["height"],
+        blur_rect=blur_rect,
+        output_ass_path=ass_file,
+        font_name=config.font_name,
+        font_size=font_size
+    )
+    print(f"[+] Đã tạo file phụ đề ASS chuẩn Unicode tiếng Việt: {ass_file}")
+
+    # 7. Trộn âm thanh và xuất video MP4 hoàn thiện
+    try:
+        mix_video_and_audio(
+            video_path=config.video_path,
+            voice_track_wav=voice_track_wav,
+            ass_path=ass_file,
+            blur_rect=blur_rect,
+            output_path=config.output_path,
+            work_dir=config.work_dir,
+            mask_sigma=config.mask_sigma,
+            keep_original_vol=config.keep_original_vol,
+            use_ducking=config.use_ducking,
+            fonts_dir=config.fonts_dir
+        )
+    except Exception as e:
+        print(f"[LỖI XUẤT VIDEO] {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print("HOÀN TẤT TOÀN BỘ ĐƯỜNG ỐNG TỰ ĐỘNG THUYẾT MINH VIDEO!")
+    print(f"File video thành phẩm: {os.path.abspath(config.output_path)}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
