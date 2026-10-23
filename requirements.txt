@@ -1,0 +1,20 @@
+# Thư viện OCR (nhẹ, pre-trained model tiếng Trung, chạy mượt trên CPU)
+rapidocr-onnxruntime>=1.3.0
+Pillow>=9.5.0
+numpy>=1.23.0
+
+# Thư viện Dịch thuật (REST client)
+requests>=2.28.0
+
+# Thư viện TTS (Thuyết minh)
+# 1. Kokoro-Vietnamese: https://github.com/iamdinhthuan/Kokoro-Vietnamese
+# Cài đặt qua git clone hoặc pip:
+# pip install git+https://github.com/iamdinhthuan/Kokoro-Vietnamese.git
+# Hoặc kokoro-onnx
+soundfile>=0.12.0
+
+# 2. Edge-TTS (Dự phòng chất lượng cao miễn phí của Microsoft)
+edge-tts>=6.1.0
+
+# Thư viện Test
+pytest>=7.0.0
