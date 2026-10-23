@@ -23,6 +23,14 @@ from src.config import AppConfig, SubtitleCue
 from src.video_utils import get_video_info, generate_preview_region
 from src.ocr.engine import process_video_ocr
 from src.ocr.grouper import group_cues, cues_to_json_dict, json_dict_to_cues
+from src.translation import (
+    BaseTranslator,
+    EchoTranslator,
+    OllamaTranslator,
+    GeminiTranslator,
+    translate_cues_in_batches
+)
+from src.translation.batch import save_cues_vi, load_cues_vi
 
 
 def parse_arguments() -> AppConfig:
@@ -206,6 +214,57 @@ def step_ocr_and_group(config: AppConfig) -> list:
     return cues
 
 
+def get_translator(config: AppConfig) -> BaseTranslator:
+    """Khởi tạo bộ máy dịch tương ứng theo tham số --translate."""
+    t_type = config.translator_type.lower()
+    if t_type == "ollama":
+        model = config.model_name or "qwen2.5:7b"
+        return OllamaTranslator(model=model)
+    elif t_type == "gemini":
+        model = config.model_name or "gemini-1.5-flash"
+        return GeminiTranslator(model=model)
+    elif t_type == "echo":
+        return EchoTranslator()
+    else:
+        raise ValueError(f"Không hỗ trợ bộ máy dịch: '{config.translator_type}'. Chỉ chọn: ollama, gemini, echo.")
+
+
+def step_translate(cues: list, config: AppConfig) -> list:
+    """Xử lý Bước 4 (Dịch thuật sang tiếng Việt). Hỗ trợ đọc lại cache cues_vi.json."""
+    cues_vi_file = os.path.join(config.work_dir, "cues_vi.json")
+
+    # Kiểm tra cache cues_vi.json đã tồn tại từ lần chạy trước hoặc người dùng đã sửa tay
+    if os.path.exists(cues_vi_file):
+        print(f"[*] Tìm thấy file bản dịch đã có: {cues_vi_file}")
+        print("[*] Đang tải lại bản dịch tiếng Việt (bỏ qua gọi AI)...")
+        translated_cues = load_cues_vi(cues_vi_file)
+        print(f"[+] Đã tải thành công {len(translated_cues)} câu đã dịch từ {cues_vi_file}")
+        return translated_cues
+
+    print("=" * 60)
+    print("BƯỚC 4: DỊCH THUẬT PHỤ ĐỀ SANG TIẾNG VIỆT")
+    print("=" * 60)
+
+    translator = get_translator(config)
+    translated_cues = translate_cues_in_batches(
+        cues=cues,
+        translator=translator,
+        batch_size=config.batch_size,
+        context_count=3
+    )
+
+    # Lưu lại file cues_vi.json
+    save_cues_vi(translated_cues, cues_vi_file)
+    print(f"[+] Đã lưu bản dịch tiếng Việt vào: {cues_vi_file}")
+
+    for c in translated_cues[:5]:
+        print(f"    [{c.start:.2f}s -> {c.end:.2f}s] ZH: {c.text_zh} => VI: {c.text_vi}")
+    if len(translated_cues) > 5:
+        print(f"    ... và {len(translated_cues) - 5} câu tiếp theo.")
+
+    return translated_cues
+
+
 def main():
     try:
         config = parse_arguments()
@@ -227,7 +286,7 @@ def main():
             sys.exit(1)
         return
 
-    # Chế độ 2: Chạy OCR & Gom câu
+    # Chế độ 2: Chạy OCR & Gom câu (hoặc nạp từ cues.json)
     try:
         cues = step_ocr_and_group(config)
     except Exception as e:
@@ -240,6 +299,22 @@ def main():
         print("[!] Đã dừng theo tham số --stop-after ocr.")
         print(f"[!] Bạn có thể mở file '{config.work_dir}/cues.json' để kiểm tra hoặc chỉnh sửa câu chữ.")
         print("[!] Sau đó chạy lại lệnh (hệ thống sẽ tự động dùng lại file này mà không cần OCR lại).")
+        print("=" * 60)
+        return
+
+    # Chế độ 3: Dịch thuật sang tiếng Việt (hoặc nạp từ cues_vi.json)
+    try:
+        translated_cues = step_translate(cues, config)
+    except Exception as e:
+        print(f"[LỖI DỊCH THUẬT] {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Kiểm tra dừng sau Translate
+    if config.stop_after == "translate":
+        print("=" * 60)
+        print("[!] Đã dừng theo tham số --stop-after translate.")
+        print(f"[!] Bạn có thể mở file '{config.work_dir}/cues_vi.json' để kiểm tra hoặc trau chuốt lại câu dịch.")
+        print("[!] Sau đó chạy lại lệnh (hệ thống sẽ dùng trực tiếp bản dịch đã sửa để làm mờ, phụ đề và đọc giọng).")
         print("=" * 60)
         return
 
