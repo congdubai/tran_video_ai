@@ -51,3 +51,7 @@ preview_region.jpg
 
 # Environment variables
 .env
+
+node_modules/
+web/node_modules/
+web/dist/
